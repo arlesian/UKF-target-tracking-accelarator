@@ -1,0 +1,4 @@
+/workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/CMakeFiles/run_sim.dir
+/workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/CMakeFiles/open_wave.dir
+/workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/CMakeFiles/edit_cache.dir
+/workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/CMakeFiles/rebuild_cache.dir
