@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from numpy.linalg import inv, cholesky
+from numpy.linalg import inv, cholesky, qr
+from scipy.linalg import solve_triangular
 import os
 
 ## notes to myself:
@@ -9,6 +10,9 @@ import os
 # FIX: circular mean for angles in measurement prediction
 # FIX: modified posterori calculation using joint measurement update
 # NEED: find the q-format to use for verilog implementation
+# NEED: changed implementation to SR-UKF for numerical stability
+# NEED: refine implementation of cholesky update/downdate (just use cholesky function for now)
+# NEED: write report summarizing the python simulation
 
 np.random.seed(4)
 
@@ -66,7 +70,7 @@ def cartesian_to_ir(dx, dy, dz):
 class UKF:
     def __init__(self, x_dim, alpha=1e-3, beta=2, kappa=0):
         self.x = np.zeros(x_dim)
-        self.P = np.eye(x_dim)
+        self.S = np.eye(x_dim)
 
         self.Q = np.eye(x_dim) * 0.05
 
@@ -78,6 +82,47 @@ class UKF:
 
         self._compute_weights(x_dim, alpha, beta, kappa)
 
+    def _cholesky_update(self, L, x, lower=True, downdate=False):
+        """
+        Rank-1 Cholesky update/downdate.
+        L: Cholesky factor (lower or upper triangular)
+        x: vector
+        """
+
+        L = L.copy() # use copy of L by default
+        x = x.copy()
+        n = L.shape[0]
+
+        for k in range(n):
+            if downdate:
+                r_sq = L[k, k]**2 - x[k]**2
+                if r_sq <= 0:
+                    raise np.linalg.LinAlgError("Downdate breaks PD")
+                r = np.sqrt(r_sq)
+            else:
+                r = np.sqrt(L[k, k]**2 + x[k]**2)
+
+            c = r / L[k, k]
+            s = x[k] / L[k, k]
+            L[k, k] = r
+
+            if k + 1 < n:
+                if lower:
+                    if downdate:
+                        L[k+1:n, k] = (L[k+1:n, k] - s * x[k+1:n]) / c
+                    else:
+                        L[k+1:n, k] = (L[k+1:n, k] + s * x[k+1:n]) / c
+                    x[k+1:n] = c * x[k+1:n] - s * L[k+1:n, k]
+                else:
+                    if downdate:
+                        L[k, k+1:n] = (L[k, k+1:n] - s * x[k+1:n]) / c
+                    else:
+                        L[k, k+1:n] = (L[k, k+1:n] + s * x[k+1:n]) / c
+                    x[k+1:n] = c * x[k+1:n] - s * L[k, k+1:n]
+
+        return L
+
+
     def _compute_weights(self, n, alpha, beta, kappa):
         self.lambda_ = alpha**2 * (n + kappa) - n
         self.wm = np.full(2*n+1, 1/(2*(n+self.lambda_)))
@@ -85,15 +130,16 @@ class UKF:
         self.wm[0] = self.lambda_ / (n + self.lambda_)
         self.wc[0] = self.lambda_ / (n + self.lambda_) + (1 - alpha**2 + beta)
 
-    def _sigma_points(self, x, P):
+    def _sigma_points(self, x, S):
         n = len(x)
         sigma = np.zeros((2*n+1, n))
         sigma[0] = x
+        gamma = np.sqrt(n + self.lambda_)
         # FIX: ensure P is positive definite
-        sqrtP = cholesky((n + self.lambda_) * (P + 1e-5 * np.eye(P.shape[0])))
+        weighted_S = gamma * S
         for i in range(n):
-            sigma[i+1] = x + sqrtP[:, i]
-            sigma[n+i+1] = x - sqrtP[:, i]
+            sigma[i+1] = x + weighted_S[:, i]
+            sigma[n+i+1] = x - weighted_S[:, i]
         return sigma
 
     def _wrap_angle_diff(self, d, idxs):
@@ -121,19 +167,29 @@ class UKF:
         ])
 
     def predict(self, dt):
-        sigma = self._sigma_points(self.x, self.P)
+        sigma = self._sigma_points(self.x, self.S)
         sigma_f = np.array([self.f(sp, dt) for sp in sigma])
 
         self.x = np.sum(self.wm[:, None] * sigma_f, axis=0)
 
-        ### FIX: add Q to covariance
-        self.P = self.Q.copy()
+        # ### FIX: add Q to covariance
+        # for i in range(sigma_f.shape[0]):
+        #     d = sigma_f[i] - self.x
+        #     P += self.wc[i] * np.outer(d, d)
+
+        # P = 0.5 * (self.P + self.P.T)
+        # self.S = cholesky(P + 1e-6 * np.eye(self.x.shape[0]))
+
+        # NEED: check if range is correct
+        deviations = []
         for i in range(sigma_f.shape[0]):
-            d = sigma_f[i] - self.x
-            self.P += self.wc[i] * np.outer(d, d)
-
-        self.P = 0.5 * (self.P + self.P.T)
-
+            sign_wc = np.sign(self.wc[i])
+            deviations.append(sign_wc * np.sqrt(np.abs(self.wc[i])) * (sigma_f[i] - self.x))
+        Sq = cholesky(self.Q)
+        process_noise_cols = [Sq[:, j] for j in range(self.Q.shape[0])]
+        A = np.column_stack(deviations + process_noise_cols)
+        _, R = qr(A.T, mode='reduced')
+        self.S = R.T
     # -----------------------------------------------------
     # Measurement models
     # -----------------------------------------------------
@@ -157,7 +213,10 @@ class UKF:
     # -----------------------------------------------------
     def update(self, z_radar, z_ir, ego):
 
-        sigma = self._sigma_points(self.x, self.P)
+        # note: self.S = S- (priori cholesky factor)
+        # note : S = cholesky of measurement covariance
+
+        sigma = self._sigma_points(self.x, self.S)
         sigma_f = np.array([self.f(sp, 0) for sp in sigma])
 
         Z_radar = np.array([self.h_radar(sp, ego) for sp in sigma_f])
@@ -182,14 +241,32 @@ class UKF:
             [self.R_radar, np.zeros((4, 2))],
             [np.zeros((2, 4)), self.R_ir]
         ])
-        S += R_joint
+        # S += R_joint
 
         ang_idx = [1, 2, 4, 5]
-        for i in range(Z_joint.shape[0]):
+        # for i in range(Z_joint.shape[0]):
+        #     dz = Z_joint[i] - z_pred
+        #     dz = self._wrap_angle_diff(dz, ang_idx)
+        #     S += self.wc[i] * np.outer(dz, dz)
+
+        # used qr method
+        Az = []
+
+        for i in range(sigma_f.shape[0]):
             dz = Z_joint[i] - z_pred
             dz = self._wrap_angle_diff(dz, ang_idx)
-            S += self.wc[i] * np.outer(dz, dz)
+            sign_wc = np.sign(self.wc[i])
+            Az.append(sign_wc * np.sqrt(np.abs(self.wc[i])) * dz)
 
+        Sr = cholesky(R_joint)
+        for j in range(dim_z):
+            Az.append(Sr[:, j])
+
+        Az = np.column_stack(Az)
+        _, R = qr(Az.T, mode='reduced')
+        Sz = R.T
+
+        # no way to use qr method
         Pxz = np.zeros((self.x.shape[0], dim_z))
         for i in range(Z_joint.shape[0]):
             dx = sigma_f[i] - self.x
@@ -197,15 +274,37 @@ class UKF:
             dz = self._wrap_angle_diff(dz, ang_idx)
             Pxz += self.wc[i] * np.outer(dx, dz)
 
-        S = 0.5 * (S + S.T) + 1e-6 * np.eye(dim_z)
-        K = Pxz @ inv(S)
+        U = solve_triangular(Sz.T, Pxz.T, lower=False)
+        K = solve_triangular(Sz, U, lower=True).T
 
-        y = z_joint - z_pred
-        y = self._wrap_angle_diff(y, ang_idx)
+        V = K @ Sz   # shape: (state_dim, meas_dim)
 
-        self.x += K @ y
-        self.P -= K @ S @ K.T
-        self.P = 0.5 * (self.P + self.P.T)
+        ## NOTE: actual logic for FPGA implementation, but used cholesky of posterior P for stability in python
+        # S_new = self.S.copy()
+        # for j in range(dim_z):
+        #     S_new = self._cholesky_update(S_new, V[:, j], lower=True, downdate=True)
+        # # for j in range(V.shape[1]):
+        # #     S_new = cholesky_update(S_new, V[:, j], downdate=True)
+
+        # self.S = S_new
+
+        P_post = self.S @ self.S.T - V @ V.T
+        P_post = 0.5 * (P_post + P_post.T)
+        try:
+            self.S = cholesky(P_post + 1e-6 * np.eye(self.x.shape[0]))
+        except np.linalg.LinAlgError:
+            self.S = cholesky(P_post + 1e-1 * np.eye(self.x.shape[0]))
+
+        self.x += K @ self._wrap_angle_diff(z_joint - z_pred, ang_idx) # k*innovation
+
+        # K = Pxz @ inv(S)
+
+        # y = z_joint - z_pred
+        # y = self._wrap_angle_diff(y, ang_idx)
+
+        # self.x += K @ y
+        # self.P -= K @ S @ K.T
+        # self.P = 0.5 * (self.P + self.P.T)
 
 
 # =========================================================
