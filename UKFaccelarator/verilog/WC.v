@@ -13,7 +13,8 @@ module WC #(
 
     output wire            [DATA_W-1:0] w0m,
     output wire            [DATA_W-1:0] w0c,
-    output wire            [DATA_W-1:0] w
+    output wire            [DATA_W-1:0] w,
+    output reg                         done
     );
 
     // --------------------------------------------------
@@ -30,19 +31,25 @@ module WC #(
 
     localparam IDLE     = 3'b0;
     localparam CALC_A   = 3'b1; // A = alpha^2
-    localparam CALC_B   = 3'b2; // B = L+k
-    localparam CALC_C   = 3'b3; // C = A * B
-    localparam CALC_w   = 3'b4; // D = INV(C), lambda = C - L
-    localparam CALC_w0m = 3'b5; // E = lambda * D, F = (1 - A + beta) / 2
-    localparam CALC_w0c = 3'b6; // w0c = E + F
+    // localparam CALC_B   = 3'b2; // B = L+k NO NEED
+    localparam CALC_C   = 3'b2; // C = A * B
+    localparam CALC_w   = 3'b3; // D = INV(C), lambda = C - L
+    localparam CALC_w0m = 3'b4; // E = lambda * D, F = (1 - A + beta) / 2 ( right shift )
+    // localparam CALC_w0c = 3'b6; // w0c = E + F NO NEED
+    localparam DONE     = 3'b5;
 
-    reg [DATA_W-1:0] A;
-    reg [DATA_W-1:0] B;
-    reg [DATA_W-1:0] C;
-    reg [DATA_W-1:0] D;
-    reg [DATA_W-1:0] E;
-    reg [DATA_W-1:0] F;
-    reg [DATA_W-1:0] lambda;
+    reg  [DATA_W-1:0] A;
+    wire [DATA_W-1:0] B;
+    reg  [DATA_W-1:0] C;
+    reg  [DATA_W-1:0] D;
+    reg  [DATA_W-1:0] E;
+    reg  [DATA_W-1:0] F;
+    reg  [DATA_W-1:0] lambda;
+
+    assign B   = N_STATE + kappa;
+    assign w   = D >>> 1; // D divided by 2
+    assign w0m = E >>> 1;
+    assign w0c = ( E + F ) >>> 1;
 
     reg [DATA_W-1:0] mul_a;
     reg [DATA_W-1:0] mul_b;
@@ -71,6 +78,7 @@ module WC #(
         .DATA_W(DATA_W)
         .INT_BITS(INT_BITS),
         .FRAC_BITS(FRAC_BITS)
+        // using default N_ITER = 3
     ) wc_inv (
         .clk(clk),
         .rstn(rstn),
@@ -81,31 +89,27 @@ module WC #(
         .done(done)
     )
 
-
-
     always @(posedge clk or negedge rstn) begin
         if (!rstn) begin
             state <= IDLE;
+            done <= 1'b0;
         end else begin
             case (state)
                 IDLE: begin
                     if (en)
                         state <= CALC_A;
+                    done <= 1'b0;
                 end
                 CALC_A: begin
                     mul_a <= alpha;
                     mul_b <= alpha;
-                    A <= p;
+                    A     <= p;
                     state <= CALC_B
-                end
-                CALC_B: begin
-                    B <= N_STATE + kappa;
-                    state <= CALC_C
                 end
                 CALC_C: begin
                     mul_a <= A;
                     mul_b <= B;
-                    C <= p;
+                    C     <= p;
                     state <= CALC_w;
                 end
                 CALC_w: begin
@@ -121,12 +125,13 @@ module WC #(
                 CALC_w0m: begin
                     mul_a <= lambda;
                     mul_b <= D;
-                    E <= p;
- // NEED: finish fsm logic
+                    E     <= p;
+                    F     <= ( 1 - A + beta ) >>> 1; // divide (1 - A + beta) by 2
+                    state <= DONE;
                 end
-                    
-
-
+                DONE: begin
+                    done <= 1'b1; // stay saturated at DONE, only resets when !rstn is given
+                end
             endcase
         end
     end

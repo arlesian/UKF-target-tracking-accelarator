@@ -19,31 +19,13 @@ module MUL #(
     // NOTE: may be better to pipeline this multiplication or make a separate module
 endmodule
 
-// NEED: finish implementing the multi cycle divide logic
-module DIV #(
-    parameter DATA_W = 32,
-    parameter INT_BITS = 8, // including sign bit
-    parameter FRAC_BITS = 24
- ) (
-    input wire                      clk,
-    input wire                      rstn, 
-    input wire [DATA_W-1:0]         dd, // dividend
-    input wire [DATA_W-1:0]         ds, // divisor
-
-    output wire [DATA_W-1:0]        q
- );
- 
-    // --------------------------------------------------
-    // divider
-    // --------------------------------------------------
-    assign q = ( ds == 0 ) ? 0 : ( $signed(dd) / $signed(ds) );
-    // asserted that divisor is never zero
-
-endmodule
+// NOTE: no need for div; just inv -> mul
 
 // multi-clk inv module using the newton-raphson method(combinatorial delay is too big)
+// x_k+1 = x_k * ( 2 - dd * x_k ) 
 module INV #(
     parameter DATA_W    = 32,
+    parameter INT_BITS  = 8,
     parameter FRAC_BITS = 24,
     parameter N_ITER    = 3
 )(
@@ -74,6 +56,7 @@ module INV #(
     wire signed [2*DATA_W-1:0] mult_full;
 
     // shared multiplier
+    // could use MUL, but using full mult result is better here
     assign mult_full = $signed(dd) * $signed(x);
 
     always @(posedge clk or negedge rstn) begin
