@@ -1,375 +1,213 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from numpy.linalg import inv, cholesky, qr
-from scipy.linalg import solve_triangular
 import os
-
-## notes to myself:
-# FIX: fix errors regarding cova not being pos def -> fixed by adding small value to diag
-# FIX: ensured angles are wrapped correctly during mean and diff calculations
-# FIX: circular mean for angles in measurement prediction
-# FIX: modified posterori calculation using joint measurement update
-# NEED: find the q-format to use for verilog implementation
-# NEED: changed implementation to SR-UKF for numerical stability
-# NEED: refine implementation of cholesky update/downdate (just use cholesky function for now)
-# NEED: write report summarizing the python simulation
-
-np.random.seed(4)
-
-# =========================================================
-# True target trajectory
-# =========================================================
-def true_trajectory(t):
-    base_x = 50 * np.sin(0.3 * t)
-    base_y = 30 * np.sin(0.7 * t + 1)
-    base_z = 20 * np.cos(0.5 * t)
-
-    noise = np.array([
-        np.random.normal(0, 5),
-        np.random.normal(0, 3),
-        np.random.normal(0, 2)
-    ])
-    return np.array([base_x, base_y, base_z]) + noise
+import numpy as np
+from numpy.linalg import cholesky, solve
 
 
-# =========================================================
-# Ego (IMU-based) trajectory
-# =========================================================
-def ego_trajectory(t):
-    px = 5 * np.sin(0.05 * t)
-    py = 3 * np.cos(0.05 * t)
-    pz = 0.0
+def true_state(t):
+    px = 50.0 * np.sin(0.1 * t)
+    py = 30.0 * np.sin(0.07 * t + 1.0)
+    pz = 20.0 * np.cos(0.05 * t)
 
-    vx = 5 * 0.05 * np.cos(0.05 * t)
-    vy = -3 * 0.05 * np.sin(0.05 * t)
-    vz = 0.0
-
-    return np.array([px, py, pz, vx, vy, vz])
+    vx = 5.0 * np.cos(0.1 * t)
+    vy = 2.1 * np.cos(0.07 * t + 1.0)
+    vz = -1.0 * np.sin(0.05 * t)
+    return np.array([px, py, pz, vx, vy, vz], dtype=float)
 
 
-# =========================================================
-# Coordinate transforms
-# =========================================================
-def cartesian_to_spherical(dx, dy, dz, vx, vy, vz):
-    r = np.sqrt(dx**2 + dy**2 + dz**2) + 1e-6
-    az = np.arctan2(dy, dx)
-    el = np.arctan2(dz, np.sqrt(dx**2 + dy**2))
-    r_dot = (dx*vx + dy*vy + dz*vz) / r
-    return np.array([r, az, el, r_dot])
+def process_noise_covariance(dt, accel_std):
+    q = accel_std ** 2
+    block = np.array(
+        [
+            [dt**4 / 4.0, dt**3 / 2.0],
+            [dt**3 / 2.0, dt**2],
+        ],
+        dtype=float,
+    )
+
+    cov = np.zeros((6, 6), dtype=float)
+    for idx in range(3):
+        start = 2 * idx
+        cov[start:start + 2, start:start + 2] = q * block
+
+    # Reorder from [x, vx, y, vy, z, vz] blocks to [x, y, z, vx, vy, vz].
+    order = [0, 2, 4, 1, 3, 5]
+    return cov[np.ix_(order, order)]
 
 
-def cartesian_to_ir(dx, dy, dz):
-    az = np.arctan2(dy, dx)
-    el = np.arctan2(dz, np.sqrt(dx**2 + dy**2))
-    return np.array([az, el])
-
-
-# =========================================================
-# Unscented Kalman Filter
-# =========================================================
 class UKF:
-    def __init__(self, x_dim, alpha=1e-3, beta=2, kappa=0):
-        self.x = np.zeros(x_dim)
-        self.S = np.eye(x_dim)
+    def __init__(self, x_dim, z_dim, alpha=0.3, beta=2.0, kappa=0.0):
+        self.x = np.zeros(x_dim, dtype=float)
+        self.P = np.eye(x_dim, dtype=float)
 
-        self.Q = np.eye(x_dim) * 0.05
+        self.Q = np.eye(x_dim, dtype=float) * 1e-3
+        self.R = np.eye(z_dim, dtype=float)
 
-        # Radar: [r, az, el, r_dot]
-        self.R_radar = np.diag([5.0, 0.01, 0.01, 5.0])
-
-        # IR: [az, el]
-        self.R_ir = np.diag([0.01, 0.01])
-
+        self.lambda_ = None
+        self.wm = None
+        self.wc = None
         self._compute_weights(x_dim, alpha, beta, kappa)
-
-    def _cholesky_update(self, L, x, lower=True, downdate=False):
-        """
-        Rank-1 Cholesky update/downdate.
-        L: Cholesky factor (lower or upper triangular)
-        x: vector
-        """
-
-        L = L.copy() # use copy of L by default
-        x = x.copy()
-        n = L.shape[0]
-
-        for k in range(n):
-            if downdate:
-                r_sq = L[k, k]**2 - x[k]**2
-                if r_sq <= 0:
-                    raise np.linalg.LinAlgError("Downdate breaks PD")
-                r = np.sqrt(r_sq)
-            else:
-                r = np.sqrt(L[k, k]**2 + x[k]**2)
-
-            c = r / L[k, k]
-            s = x[k] / L[k, k]
-            L[k, k] = r
-
-            if k + 1 < n:
-                if lower:
-                    if downdate:
-                        L[k+1:n, k] = (L[k+1:n, k] - s * x[k+1:n]) / c
-                    else:
-                        L[k+1:n, k] = (L[k+1:n, k] + s * x[k+1:n]) / c
-                    x[k+1:n] = c * x[k+1:n] - s * L[k+1:n, k]
-                else:
-                    if downdate:
-                        L[k, k+1:n] = (L[k, k+1:n] - s * x[k+1:n]) / c
-                    else:
-                        L[k, k+1:n] = (L[k, k+1:n] + s * x[k+1:n]) / c
-                    x[k+1:n] = c * x[k+1:n] - s * L[k, k+1:n]
-
-        return L
-
 
     def _compute_weights(self, n, alpha, beta, kappa):
         self.lambda_ = alpha**2 * (n + kappa) - n
-        self.wm = np.full(2*n+1, 1/(2*(n+self.lambda_)))
-        self.wc = np.full(2*n+1, 1/(2*(n+self.lambda_)))
-        self.wm[0] = self.lambda_ / (n + self.lambda_)
-        self.wc[0] = self.lambda_ / (n + self.lambda_) + (1 - alpha**2 + beta)
+        scale = n + self.lambda_
+        if scale <= 0.0:
+            raise ValueError(
+                "Invalid UKF parameters: alpha and kappa must produce n + lambda > 0."
+            )
+        self.wm = np.full(2 * n + 1, 1.0 / (2.0 * scale), dtype=float)
+        self.wc = np.full(2 * n + 1, 1.0 / (2.0 * scale), dtype=float)
+        self.wm[0] = self.lambda_ / scale
+        self.wc[0] = self.lambda_ / scale + (1.0 - alpha**2 + beta)
 
-    def _sigma_points(self, x, S):
+    def _stabilize_covariance(self, cov, min_diagonal=1e-9):
+        cov = 0.5 * (cov + cov.T)
+        diagonal = np.diag(cov)
+        min_value = np.min(diagonal)
+        if min_value < min_diagonal:
+            cov = cov + np.eye(cov.shape[0], dtype=float) * (min_diagonal - min_value)
+        return cov
+
+    def _sigma_points(self, x, P):
         n = len(x)
-        sigma = np.zeros((2*n+1, n))
-        sigma[0] = x
-        gamma = np.sqrt(n + self.lambda_)
-        # FIX: ensure P is positive definite
-        weighted_S = gamma * S
+        sigma_points = np.zeros((2 * n + 1, n), dtype=float)
+        sigma_points[0] = x
+
+        stabilized_P = self._stabilize_covariance(P)
+        sqrt_P = cholesky((n + self.lambda_) * stabilized_P)
         for i in range(n):
-            sigma[i+1] = x + weighted_S[:, i]
-            sigma[n+i+1] = x - weighted_S[:, i]
-        return sigma
+            sigma_points[i + 1] = x + sqrt_P[:, i]
+            sigma_points[n + i + 1] = x - sqrt_P[:, i]
 
-    def _wrap_angle_diff(self, d, idxs):
-        for j in idxs:
-            d[j] = (d[j] + np.pi) % (2*np.pi) - np.pi
-        return d
+        return sigma_points
 
-    def _circular_mean(self, angles):
-        s = np.sum(self.wm * np.sin(angles))
-        c = np.sum(self.wm * np.cos(angles))
-        return np.arctan2(s, c)
-
-    # -----------------------------------------------------
-    # Motion model
-    # -----------------------------------------------------
     def f(self, x, dt):
         px, py, pz, vx, vy, vz = x
-        return np.array([
-            px + vx*dt,
-            py + vy*dt,
-            pz + vz*dt,
-            vx,
-            vy,
-            vz
-        ])
+        return np.array(
+            [
+                px + vx * dt,
+                py + vy * dt,
+                pz + vz * dt,
+                vx,
+                vy,
+                vz,
+            ],
+            dtype=float,
+        )
+
+    def h(self, x):
+        return x[:3].copy()
 
     def predict(self, dt):
-        sigma = self._sigma_points(self.x, self.S)
-        sigma_f = np.array([self.f(sp, dt) for sp in sigma])
+        sigma_points = self._sigma_points(self.x, self.P)
+        propagated = np.array([self.f(point, dt) for point in sigma_points], dtype=float)
 
-        self.x = np.sum(self.wm[:, None] * sigma_f, axis=0)
+        x_pred = np.sum(self.wm[:, None] * propagated, axis=0)
 
-        # ### FIX: add Q to covariance
-        # for i in range(sigma_f.shape[0]):
-        #     d = sigma_f[i] - self.x
-        #     P += self.wc[i] * np.outer(d, d)
+        P_pred = self.Q.copy()
+        for i in range(propagated.shape[0]):
+            diff = propagated[i] - x_pred
+            P_pred += self.wc[i] * np.outer(diff, diff)
 
-        # P = 0.5 * (self.P + self.P.T)
-        # self.S = cholesky(P + 1e-6 * np.eye(self.x.shape[0]))
+        self.x = x_pred
+        self.P = self._stabilize_covariance(P_pred)
 
-        # NEED: check if range is correct
-        deviations = []
-        for i in range(sigma_f.shape[0]):
-            sign_wc = np.sign(self.wc[i])
-            deviations.append(sign_wc * np.sqrt(np.abs(self.wc[i])) * (sigma_f[i] - self.x))
-        Sq = cholesky(self.Q)
-        process_noise_cols = [Sq[:, j] for j in range(self.Q.shape[0])]
-        A = np.column_stack(deviations + process_noise_cols)
-        _, R = qr(A.T, mode='reduced')
-        self.S = R.T
-    # -----------------------------------------------------
-    # Measurement models
-    # -----------------------------------------------------
-    def h_radar(self, x, ego):
-        px, py, pz, vx, vy, vz = x
-        ego_pos = ego[:3]
-        ego_vel = ego[3:]
+    def update(self, z):
+        sigma_points = self._sigma_points(self.x, self.P)
+        measured = np.array([self.h(point) for point in sigma_points], dtype=float)
 
-        dx, dy, dz = px-ego_pos[0], py-ego_pos[1], pz-ego_pos[2]
-        rvx, rvy, rvz = vx-ego_vel[0], vy-ego_vel[1], vz-ego_vel[2]
+        z_pred = np.sum(self.wm[:, None] * measured, axis=0)
 
-        return cartesian_to_spherical(dx, dy, dz, rvx, rvy, rvz)
+        S = self.R.copy()
+        cross_cov = np.zeros((self.x.shape[0], z.shape[0]), dtype=float)
+        for i in range(measured.shape[0]):
+            dz = measured[i] - z_pred
+            dx = sigma_points[i] - self.x
+            S += self.wc[i] * np.outer(dz, dz)
+            cross_cov += self.wc[i] * np.outer(dx, dz)
 
-    def h_ir(self, x, ego):
-        px, py, pz, *_ = x
-        dx, dy, dz = px-ego[0], py-ego[1], pz-ego[2]
-        return cartesian_to_ir(dx, dy, dz)
+        K = solve(S.T, cross_cov.T).T
+        innovation = z - z_pred
 
-    # -----------------------------------------------------
-    # Joint update
-    # -----------------------------------------------------
-    def update(self, z_radar, z_ir, ego):
-
-        # note: self.S = S- (priori cholesky factor)
-        # note : S = cholesky of measurement covariance
-
-        sigma = self._sigma_points(self.x, self.S)
-        sigma_f = np.array([self.f(sp, 0) for sp in sigma])
-
-        Z_radar = np.array([self.h_radar(sp, ego) for sp in sigma_f])
-        Z_ir = np.array([self.h_ir(sp, ego) for sp in sigma_f])
-
-        Z_joint = np.hstack((Z_radar, Z_ir))
-        z_joint = np.hstack((z_radar, z_ir))
-
-        z_pred = np.zeros_like(z_joint)
-
-        ### FIX: circular mean for angles
-        z_pred[0] = np.sum(self.wm * Z_joint[:, 0])     # range
-        z_pred[3] = np.sum(self.wm * Z_joint[:, 3])     # r_dot
-        for idx in [1, 2, 4, 5]:
-            z_pred[idx] = self._circular_mean(Z_joint[:, idx])
-
-        dim_z = z_joint.shape[0]
-        S = np.zeros((dim_z, dim_z))
-
-        ### FIX: add measurement noise
-        R_joint = np.block([
-            [self.R_radar, np.zeros((4, 2))],
-            [np.zeros((2, 4)), self.R_ir]
-        ])
-        # S += R_joint
-
-        ang_idx = [1, 2, 4, 5]
-        # for i in range(Z_joint.shape[0]):
-        #     dz = Z_joint[i] - z_pred
-        #     dz = self._wrap_angle_diff(dz, ang_idx)
-        #     S += self.wc[i] * np.outer(dz, dz)
-
-        # used qr method
-        Az = []
-
-        for i in range(sigma_f.shape[0]):
-            dz = Z_joint[i] - z_pred
-            dz = self._wrap_angle_diff(dz, ang_idx)
-            sign_wc = np.sign(self.wc[i])
-            Az.append(sign_wc * np.sqrt(np.abs(self.wc[i])) * dz)
-
-        Sr = cholesky(R_joint)
-        for j in range(dim_z):
-            Az.append(Sr[:, j])
-
-        Az = np.column_stack(Az)
-        _, R = qr(Az.T, mode='reduced')
-        Sz = R.T
-
-        # no way to use qr method
-        Pxz = np.zeros((self.x.shape[0], dim_z))
-        for i in range(Z_joint.shape[0]):
-            dx = sigma_f[i] - self.x
-            dz = Z_joint[i] - z_pred
-            dz = self._wrap_angle_diff(dz, ang_idx)
-            Pxz += self.wc[i] * np.outer(dx, dz)
-
-        U = solve_triangular(Sz.T, Pxz.T, lower=False)
-        K = solve_triangular(Sz, U, lower=True).T
-
-        V = K @ Sz   # shape: (state_dim, meas_dim)
-
-        ## NOTE: actual logic for FPGA implementation, but used cholesky of posterior P for stability in python
-        # S_new = self.S.copy()
-        # for j in range(dim_z):
-        #     S_new = self._cholesky_update(S_new, V[:, j], lower=True, downdate=True)
-        # # for j in range(V.shape[1]):
-        # #     S_new = cholesky_update(S_new, V[:, j], downdate=True)
-
-        # self.S = S_new
-
-        P_post = self.S @ self.S.T - V @ V.T
-        P_post = 0.5 * (P_post + P_post.T)
-        try:
-            self.S = cholesky(P_post + 1e-6 * np.eye(self.x.shape[0]))
-        except np.linalg.LinAlgError:
-            self.S = cholesky(P_post + 1e-1 * np.eye(self.x.shape[0]))
-
-        self.x += K @ self._wrap_angle_diff(z_joint - z_pred, ang_idx) # k*innovation
-
-        # K = Pxz @ inv(S)
-
-        # y = z_joint - z_pred
-        # y = self._wrap_angle_diff(y, ang_idx)
-
-        # self.x += K @ y
-        # self.P -= K @ S @ K.T
-        # self.P = 0.5 * (self.P + self.P.T)
+        self.x = self.x + K @ innovation
+        self.P = self._stabilize_covariance(self.P - K @ S @ K.T)
 
 
-# =========================================================
-# Simulation
-# =========================================================
-def simulate(a, b, k):
-    dt = 0.1
-    steps = 300
-    ukf = UKF(6, alpha=a, beta=b, kappa=k)
+def simulate_ukf(seed=7, time_steps=300, dt=0.1):
+    if time_steps < 2:
+        raise ValueError("time_steps must be at least 2 to initialize velocity.")
+    if dt <= 0.0:
+        raise ValueError("dt must be positive.")
 
-    true_pos, est_pos = [], []
-    prev_range = None
+    rng = np.random.default_rng(seed)
 
-    for k in range(steps):
-        print(f"Step {k+1}/{steps}", end="\r")
-        t = k * dt
-        ego = ego_trajectory(t)
-        tgt = true_trajectory(t)
+    ukf = UKF(x_dim=6, z_dim=3)
+    ukf.Q = process_noise_covariance(dt, accel_std=0.35)
+    ukf.R = np.diag([2.0**2, 2.0**2, 1.5**2]).astype(float)
 
-        rel = tgt - ego[:3]
-        r = np.linalg.norm(rel) + 1e-6
+    true_states = np.array([true_state(k * dt) for k in range(time_steps)], dtype=float)
+    true_positions = true_states[:, :3]
+    measurements = true_positions + rng.multivariate_normal(
+        mean=np.zeros(3, dtype=float),
+        cov=ukf.R,
+        size=time_steps,
+    )
 
-        if prev_range is None:
-            r_dot = 0.0
-        else:
-            r_dot = (r - prev_range) / dt
-        prev_range = r
+    ukf.x[:3] = measurements[0]
+    ukf.x[3:] = (measurements[1] - measurements[0]) / dt
+    ukf.P = np.diag([10.0, 10.0, 10.0, 25.0, 25.0, 25.0]).astype(float)
 
-        v_rel = r_dot * rel / r
+    estimates = np.zeros((time_steps, 6), dtype=float)
+    estimates[0] = ukf.x
 
-        z_radar = cartesian_to_spherical(*rel, *v_rel) + \
-                  np.random.multivariate_normal(np.zeros(4), ukf.R_radar)
-
-        z_ir = cartesian_to_ir(*rel) + \
-               np.random.multivariate_normal(np.zeros(2), ukf.R_ir)
-
+    for k in range(1, time_steps):
         ukf.predict(dt)
-        ukf.update(z_radar, z_ir, ego)
+        ukf.update(measurements[k])
+        estimates[k] = ukf.x
 
-        true_pos.append(tgt)
-        est_pos.append(ukf.x[:3])
+    position_errors = true_positions - estimates[:, :3]
+    rmse = np.sqrt(np.mean(np.sum(position_errors**2, axis=1)))
 
-    true_pos = np.array(true_pos)
-    est_pos = np.array(est_pos)
+    plot_saved = False
+    plot_path = os.path.join("simulation", "ukf_simulation.png")
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-    errors = np.linalg.norm(true_pos - est_pos, axis=1)
-    mean_error = np.mean(errors)
+        fig = plt.figure(figsize=(12, 8))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot(true_positions[:, 0], true_positions[:, 1], true_positions[:, 2], label="True trajectory", color="g")
+        ax.scatter(measurements[:, 0], measurements[:, 1], measurements[:, 2], label="Measurements", color="r", s=10, alpha=0.5)
+        ax.plot(estimates[:, 0], estimates[:, 1], estimates[:, 2], label="UKF estimate", color="b")
+        ax.set_xlabel("X Position")
+        ax.set_ylabel("Y Position")
+        ax.set_zlabel("Z Position")
+        ax.set_title(f"UKF Synthetic Tracking (RMSE={rmse:.2f})")
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        fig.savefig(plot_path, dpi=160)
+        plt.close(fig)
+        plot_saved = True
+    except ModuleNotFoundError:
+        pass
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(true_pos[:, 0], true_pos[:, 1], label="True")
-    plt.plot(est_pos[:, 0], est_pos[:, 1], label="UKF")
-    plt.legend()
-    plt.grid()
-    plt.savefig("ukf_radar_ir.png")
-    plt.show()
-
-    return mean_error
+    return {
+        "rmse": rmse,
+        "true_states": true_states,
+        "measurements": measurements,
+        "estimates": estimates,
+        "plot_saved": plot_saved,
+        "plot_path": plot_path,
+    }
 
 
 if __name__ == "__main__":
-
-    # running with best params from grid search
-    alpha = 0.2
-    beta = 2
-    kappa = 3
-
-    mean_err = simulate(alpha, beta, kappa)
-    print(f"Mean position error: {mean_err:.3f}")
+    result = simulate_ukf()
+    print(f"Finished UKF simulation. Position RMSE: {result['rmse']:.3f}")
+    if result["plot_saved"]:
+        print(f"Saved plot to {result['plot_path']}")
+    else:
+        print("matplotlib not installed; skipped plot generation")
