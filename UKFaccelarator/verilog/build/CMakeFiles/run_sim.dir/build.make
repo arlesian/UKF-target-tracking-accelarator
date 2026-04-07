@@ -71,7 +71,7 @@ CMakeFiles/run_sim: ukf.vcd
 ukf.vcd: /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/ukf.v
 ukf.vcd: /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/tb_ukf.v
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --blue --bold --progress-dir=/workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Compiling and running iverilog simulation"
-	/usr/bin/iverilog -o /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/ukf_sim.out /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/ukf.v /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/tb_ukf.v
+	/usr/bin/iverilog -g2012 -Wall -o /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/ukf_sim.out /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/ukf.v /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/tb_ukf.v
 	/usr/bin/vvp /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/ukf_sim.out
 
 run_sim: CMakeFiles/run_sim

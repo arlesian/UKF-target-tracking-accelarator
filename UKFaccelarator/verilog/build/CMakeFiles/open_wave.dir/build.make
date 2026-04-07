@@ -68,7 +68,7 @@ include CMakeFiles/open_wave.dir/progress.make
 
 CMakeFiles/open_wave:
 	/usr/bin/cmake -E echo Opening\ waveform...
-	gtkwave /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/ukf.vcd
+	/usr/bin/gtkwave /workspaces/UKF-target-tracking-accelarator/UKFaccelarator/verilog/build/ukf.vcd
 
 open_wave: CMakeFiles/open_wave
 open_wave: CMakeFiles/open_wave.dir/build.make
